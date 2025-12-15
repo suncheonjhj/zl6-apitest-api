@@ -18,7 +18,7 @@ ZL6_BASE_URL = os.getenv("ZL6_BASE_URL", "").rstrip("/")
 ZENTRA_TOKEN_ID = os.getenv("ZENTRA_TOKEN_ID", "").strip()
 ZENTRA_TOKEN_VALUE = os.getenv("ZENTRA_TOKEN_VALUE", "").strip()
 
-# 엔드포인트 (기본값)
+# 엔드포인트 경로(기본값)
 ZL6_DEVICES_PATH = os.getenv("ZL6_DEVICES_PATH", "/get_devices/")
 ZL6_READINGS_PATH = os.getenv("ZL6_READINGS_PATH", "/get_readings/")
 
@@ -44,35 +44,28 @@ def _require_env():
 
 async def zl6_get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
     """
-    ZENTRA Cloud API 호출
-    - redirect를 따라가지 않음(로그인 페이지로 튀는 문제를 잡기 위해)
-    - 인증: Basic Auth (username=TOKEN_ID, password=TOKEN_VALUE)
+    ZENTRA Cloud API 인증 (정석):
+    Basic Auth username = "TokenID:TokenValue"
+    password는 비워둠
     """
     _require_env()
     url = f"{ZL6_BASE_URL}{path}"
 
-    async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
-        r = await client.get(
-            url,
-            params=params,
-            auth=httpx.BasicAuth(ZENTRA_TOKEN_ID, ZENTRA_TOKEN_VALUE),
-        )
+    # 핵심: username에 "ID:VALUE"를 넣고 password는 ""(빈 문자열)
+    basic_user = f"{ZENTRA_TOKEN_ID}:{ZENTRA_TOKEN_VALUE}"
 
-    # 리다이렉트면(보통 로그인 페이지로 튐) location을 보여주기
+    async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
+        r = await client.get(url, params=params, auth=httpx.BasicAuth(basic_user, ""))
+
+    # redirect면 location을 보여줌(로그인 페이지로 튀는지 확인용)
     if 300 <= r.status_code < 400:
         loc = r.headers.get("location", "")
-        raise HTTPException(
-            status_code=502,
-            detail=f"ZL6 redirected: {r.status_code}, location={loc}"
-        )
+        raise HTTPException(status_code=502, detail=f"ZL6 redirected: {r.status_code}, location={loc}")
 
-    # HTTP 에러면 바디 앞부분을 보여주기
+    # HTTP 에러면 바디 앞부분을 보여줌
     if r.status_code >= 400:
         snippet = (r.text or "")[:500]
-        raise HTTPException(
-            status_code=502,
-            detail=f"ZL6 GET failed: {r.status_code} {snippet}"
-        )
+        raise HTTPException(status_code=502, detail=f"ZL6 GET failed: {r.status_code} {snippet}")
 
     # JSON인지 확인
     ctype = (r.headers.get("content-type") or "").lower()
@@ -85,9 +78,6 @@ async def zl6_get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
 
     return r.json()
 
-# ===============================
-# routes
-# ===============================
 @app.get("/health")
 async def health():
     return {"ok": True, "name": APP_NAME}
@@ -99,6 +89,7 @@ async def stations():
 
 @app.get("/api/latest")
 async def latest(device_sn: str):
+    # 최신 1개만
     params = {
         "device_sn": device_sn,
         "per_page": 1,
