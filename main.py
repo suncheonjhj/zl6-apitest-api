@@ -10,17 +10,16 @@ APP_NAME = "zl6-apitest-api"
 # ===============================
 # Render 환경변수
 # ===============================
-# 예: https://zentracloud.com/api/v4
+# US: https://zentracloud.com/api/v4
+# EU: https://zentracloud.eu/api/v4
 ZL6_BASE_URL = os.getenv("ZL6_BASE_URL", "").rstrip("/")
 
-# ZENTRA Cloud "token id" (Copy token으로 복사하면 token 접두사 포함)
+# "2 토큰" (ID + VALUE)
 ZENTRA_TOKEN_ID = os.getenv("ZENTRA_TOKEN_ID", "").strip()
+ZENTRA_TOKEN_VALUE = os.getenv("ZENTRA_TOKEN_VALUE", "").strip()
 
-# 엔드포인트 경로(기본값은 문서 예시 기반)
-# 장치 목록(=우리가 화면에서 'stations'처럼 보여줄 것)
+# 엔드포인트 (기본값)
 ZL6_DEVICES_PATH = os.getenv("ZL6_DEVICES_PATH", "/get_devices/")
-
-# 최신값(1시간 간격 데이터에서 최신 1개만 가져오게 per_page=1)
 ZL6_READINGS_PATH = os.getenv("ZL6_READINGS_PATH", "/get_readings/")
 
 app = FastAPI(title=APP_NAME)
@@ -37,40 +36,37 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ===============================
-# helpers
-# ===============================
 def _require_env():
     if not ZL6_BASE_URL:
         raise RuntimeError("ZL6_BASE_URL is missing")
-    if not ZENTRA_TOKEN_ID:
-        raise RuntimeError("ZENTRA_TOKEN_ID is missing")
-
-def _auth_header() -> Dict[str, str]:
-    """
-    ZENTRA Cloud 문서 예시 방식:
-    Authorization: Token <token-id>
-    token-id는 'token' 접두사가 포함된 형태가 권장됨.
-    사용자가 Token 접두사를 안 붙였으면 자동으로 붙여줌.
-    """
-    tok = ZENTRA_TOKEN_ID
-    # 문서 코드 스니펫처럼 "Token " 접두사 강제
-    if not tok.lower().startswith("token"):
-        tok = f"Token {tok}"
-    elif not tok.startswith("Token "):
-        # token으로 시작하지만 대소문자/형식이 애매하면 표준형으로
-        tok = f"Token {tok.split()[-1]}"
-    return {"Authorization": tok}
+    if not ZENTRA_TOKEN_ID or not ZENTRA_TOKEN_VALUE:
+        raise RuntimeError("ZENTRA_TOKEN_ID / ZENTRA_TOKEN_VALUE is missing")
 
 async def zl6_get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+    """
+    ZENTRA Cloud API 호출
+    - redirect를 따라가지 않음(로그인 페이지로 튀는 문제를 잡기 위해)
+    - 인증: Basic Auth (username=TOKEN_ID, password=TOKEN_VALUE)
+    """
     _require_env()
     url = f"{ZL6_BASE_URL}{path}"
-    headers = _auth_header()
 
-    async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
-        r = await client.get(url, params=params, headers=headers)
+    async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
+        r = await client.get(
+            url,
+            params=params,
+            auth=httpx.BasicAuth(ZENTRA_TOKEN_ID, ZENTRA_TOKEN_VALUE),
+        )
 
-    # HTTP 에러면 그대로 502로 올려서 프론트에서 보이게
+    # 리다이렉트면(보통 로그인 페이지로 튐) location을 보여주기
+    if 300 <= r.status_code < 400:
+        loc = r.headers.get("location", "")
+        raise HTTPException(
+            status_code=502,
+            detail=f"ZL6 redirected: {r.status_code}, location={loc}"
+        )
+
+    # HTTP 에러면 바디 앞부분을 보여주기
     if r.status_code >= 400:
         snippet = (r.text or "")[:500]
         raise HTTPException(
@@ -87,15 +83,7 @@ async def zl6_get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
             detail=f"ZL6 non-JSON response: {r.status_code}, content-type={ctype}, body={snippet}"
         )
 
-    # JSON 파싱
-    try:
-        return r.json()
-    except Exception:
-        snippet = (r.text or "")[:500]
-        raise HTTPException(
-            status_code=502,
-            detail=f"ZL6 JSON parse failed: {snippet}"
-        )
+    return r.json()
 
 # ===============================
 # routes
@@ -106,18 +94,11 @@ async def health():
 
 @app.get("/api/stations")
 async def stations():
-    """
-    프론트에서 'stations'로 쓰지만,
-    실제로는 ZENTRA의 device 목록을 반환.
-    """
+    # 실제로는 device 목록
     return await zl6_get(ZL6_DEVICES_PATH)
 
 @app.get("/api/latest")
 async def latest(device_sn: str):
-    """
-    최신 1개 readings.
-    프론트에서 station_id 대신 device_sn(장치 시리얼)을 사용.
-    """
     params = {
         "device_sn": device_sn,
         "per_page": 1,
